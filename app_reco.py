@@ -50,25 +50,44 @@ def load_models():
     return als_model, ranker, mappings, name_map, meta_dict, meta_full
 
 
+@st.cache_resource
+def _precompute_valid_items(_als_model, _mappings):
+    """학습된 아이템만 필터 — norm이 너무 낮은 아이템은 초기값 근처라 무의미."""
+    item_factors = _als_model.item_factors
+    norms = np.linalg.norm(item_factors, axis=1)
+    # p95 기준 (interaction이 충분한 상위 ~5% 아이템)
+    min_norm = max(np.percentile(norms[norms > 0], 90), 0.1)
+    valid_mask = norms > min_norm
+    valid_idxs = np.where(valid_mask)[0]
+    return valid_idxs, item_factors[valid_idxs], min_norm
+
+
 def find_similar_repos(query_repo_id, als_model, mappings, n_candidates=200):
-    """ALS item embedding 기반 유사 repo 검색 (Stage 1)."""
+    """ALS item embedding 기반 유사 repo 검색 (Stage 1). norm 필터 적용."""
     item2idx = mappings["item2idx"]
     idx2item = mappings["idx2item"]
 
     if query_repo_id not in item2idx:
         return []
 
+    valid_idxs, valid_factors, min_norm = _precompute_valid_items(als_model, mappings)
+
     query_idx = item2idx[query_repo_id]
     query_vec = als_model.item_factors[query_idx].reshape(1, -1)
 
-    # Cosine similarity with all items
-    sims = cosine_similarity(query_vec, als_model.item_factors)[0]
-    top_idxs = np.argsort(-sims)[1 : n_candidates + 1]  # exclude self
+    # Cosine similarity with valid items only
+    sims = cosine_similarity(query_vec, valid_factors)[0]
+    top_idxs = np.argsort(-sims)
 
     candidates = []
     for idx in top_idxs:
-        repo_id = idx2item[idx]
+        real_idx = valid_idxs[idx]
+        repo_id = idx2item[real_idx]
+        if repo_id == query_repo_id:
+            continue
         candidates.append((repo_id, float(sims[idx])))
+        if len(candidates) >= n_candidates:
+            break
     return candidates
 
 
@@ -259,7 +278,7 @@ except Exception as e:
     st.stop()
 
 # Reverse name map for search
-name_to_id = {name: rid for rid, name in name_map.items()}
+name_to_id = {name: rid for rid, name in name_map.items() if isinstance(name, str)}
 
 st.sidebar.header("설정")
 top_k = st.sidebar.slider("추천 개수", 5, 50, 20)

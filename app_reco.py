@@ -6,11 +6,13 @@ Usage:
 
 import pickle
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -134,6 +136,121 @@ def explain_recommendation(features, feature_names):
     return " · ".join(reasons)
 
 
+def _get_gh_token():
+    """gh CLI에서 토큰 가져오기."""
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "token"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _init_meta_db():
+    """SQLite 메타데이터 DB 초기화 (테이블 없으면 생성)."""
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS repo_metadata (
+            repo_id       INTEGER PRIMARY KEY,
+            repo_name     TEXT NOT NULL,
+            description   TEXT,
+            language      TEXT,
+            stargazers    INTEGER,
+            forks         INTEGER,
+            topics        TEXT,
+            license_key   TEXT,
+            created_at    TEXT,
+            updated_at    TEXT,
+            archived      INTEGER DEFAULT 0,
+            fetched_at    TEXT NOT NULL,
+            http_status   INTEGER DEFAULT 200
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def _fetch_and_cache(repo_id, repo_name):
+    """GitHub API로 가져와서 SQLite에 캐싱."""
+    token = _get_gh_token()
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        resp = requests.get(
+            f"https://api.github.com/repos/{repo_name}",
+            headers=headers,
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        d = resp.json()
+        import json
+        from datetime import datetime, timezone
+
+        meta = {
+            "repo_name": d.get("full_name", repo_name),
+            "description": d.get("description"),
+            "language": d.get("language"),
+            "stargazers": d.get("stargazers_count", 0),
+            "forks": d.get("forks_count", 0),
+            "topics": json.dumps(d.get("topics", [])),
+        }
+
+        # SQLite에 캐싱
+        conn = _init_meta_db()
+        conn.execute(
+            """INSERT OR REPLACE INTO repo_metadata
+               (repo_id, repo_name, description, language, stargazers, forks,
+                topics, fetched_at, http_status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 200)""",
+            (
+                int(repo_id),
+                meta["repo_name"],
+                meta["description"],
+                meta["language"],
+                meta["stargazers"],
+                meta["forks"],
+                meta["topics"],
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        return meta
+    except Exception:
+        return None
+
+
+def get_meta(repo_id, repo_name, meta_full):
+    """meta_full → SQLite → GitHub API 순으로 메타데이터 조회."""
+    # 1. 메모리 캐시
+    if repo_id in meta_full:
+        return meta_full[repo_id]
+    # 2. SQLite 캐시
+    if DB_PATH.exists():
+        conn = sqlite3.connect(str(DB_PATH))
+        row = conn.execute(
+            "SELECT repo_name, description, language, stargazers, forks, topics "
+            "FROM repo_metadata WHERE repo_id = ? AND http_status = 200",
+            (int(repo_id),),
+        ).fetchone()
+        conn.close()
+        if row:
+            return {
+                "repo_name": row[0], "description": row[1], "language": row[2],
+                "stargazers": row[3], "forks": row[4], "topics": row[5],
+            }
+    # 3. GitHub API fetch → SQLite 캐싱
+    if repo_name and not repo_name.startswith("repo_"):
+        return _fetch_and_cache(repo_id, repo_name) or {}
+    return {}
+
+
 # --- Main ---
 try:
     als_model, ranker, mappings, name_map, meta_dict, meta_full = load_models()
@@ -167,9 +284,28 @@ if repo_id_input:
 
 elif search_text:
     matches = [(rid, name) for name, rid in name_to_id.items() if search_text.lower() in name.lower()]
-    matches.sort(key=lambda x: x[1])
     if matches:
-        options = {f"{name} (id={rid})": rid for rid, name in matches[:20]}
+        # 한번에 SQLite에서 stars 조회
+        match_ids = [int(rid) for rid, _ in matches]
+        stars_map = {}
+        if DB_PATH.exists():
+            conn = sqlite3.connect(str(DB_PATH))
+            placeholders = ",".join("?" * len(match_ids))
+            rows = conn.execute(
+                f"SELECT repo_id, stargazers FROM repo_metadata WHERE repo_id IN ({placeholders})",
+                match_ids,
+            ).fetchall()
+            conn.close()
+            stars_map = {r[0]: r[1] or 0 for r in rows}
+
+        # stars 순 정렬
+        matches.sort(key=lambda x: stars_map.get(x[0], 0), reverse=True)
+
+        options = {}
+        for rid, name in matches[:20]:
+            stars = stars_map.get(rid, 0)
+            label = f"{name} (⭐{stars:,})" if stars else f"{name} (id={rid})"
+            options[label] = rid
         selected = st.selectbox("검색 결과", list(options.keys()))
         query_repo_id = options[selected]
     else:
@@ -178,7 +314,7 @@ elif search_text:
 # --- Recommendation ---
 if query_repo_id is not None:
     repo_name = name_map.get(query_repo_id, f"repo_{query_repo_id}")
-    meta_info = meta_full.get(query_repo_id, {})
+    meta_info = get_meta(query_repo_id, repo_name, meta_full)
 
     st.markdown(f"### 📦 [{repo_name}](https://github.com/{repo_name})")
     if meta_info.get("description"):
@@ -210,7 +346,7 @@ if query_repo_id is not None:
         rows = []
         for rank, (rid, score, features) in enumerate(ranked[:top_k], 1):
             rname = name_map.get(rid, f"repo_{rid}")
-            rmeta = meta_full.get(rid, {})
+            rmeta = get_meta(rid, rname, meta_full)
             reason = explain_recommendation(features, mappings["feature_names"])
 
             rows.append({
@@ -242,8 +378,9 @@ if query_repo_id is not None:
                     f"Score: {row['Score']} · {row['Stars']} ⭐ · {row['Language']} · "
                     f"{row['추천 이유']}"
                 )
-                if meta_full.get(row["repo_id"], {}).get("description"):
-                    st.caption(f"  {meta_full[row['repo_id']]['description']}")
+                desc = get_meta(row["repo_id"], row["Repo"], meta_full).get("description")
+                if desc:
+                    st.caption(f"  {desc}")
 
         # Feature breakdown for top-5
         with st.expander("Top-5 피처 breakdown"):

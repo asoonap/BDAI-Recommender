@@ -9,12 +9,12 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
+import faiss
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-from sklearn.metrics.pairwise import cosine_similarity
 
 # --- Paths ---
 DATA_DIR = Path("data")
@@ -51,41 +51,53 @@ def load_models():
 
 
 @st.cache_resource
-def _precompute_valid_items(_als_model, _mappings):
-    """학습된 아이템만 필터 — norm이 너무 낮은 아이템은 초기값 근처라 무의미."""
+def _build_faiss_index(_als_model, _mappings):
+    """FAISS IVFFlat 인덱스 구축 — norm 필터 + 정규화."""
     item_factors = _als_model.item_factors
     norms = np.linalg.norm(item_factors, axis=1)
-    # p95 기준 (interaction이 충분한 상위 ~5% 아이템)
     min_norm = max(np.percentile(norms[norms > 0], 90), 0.1)
-    valid_mask = norms > min_norm
-    valid_idxs = np.where(valid_mask)[0]
-    return valid_idxs, item_factors[valid_idxs], min_norm
+    valid_idxs = np.where(norms > min_norm)[0]
+    valid_factors = item_factors[valid_idxs]
+
+    # L2 normalize for cosine similarity via inner product
+    valid_normed = valid_factors / np.linalg.norm(valid_factors, axis=1, keepdims=True)
+    valid_normed = np.ascontiguousarray(valid_normed, dtype=np.float32)
+
+    nlist = min(128, len(valid_idxs) // 40)
+    quantizer = faiss.IndexFlatIP(valid_normed.shape[1])
+    index = faiss.IndexIVFFlat(quantizer, valid_normed.shape[1], nlist, faiss.METRIC_INNER_PRODUCT)
+    index.train(valid_normed)
+    index.add(valid_normed)
+    index.nprobe = 10
+
+    return index, valid_idxs, min_norm
 
 
 def find_similar_repos(query_repo_id, als_model, mappings, n_candidates=200):
-    """ALS item embedding 기반 유사 repo 검색 (Stage 1). norm 필터 적용."""
+    """ALS item embedding 기반 유사 repo 검색 (FAISS ANN)."""
     item2idx = mappings["item2idx"]
     idx2item = mappings["idx2item"]
 
     if query_repo_id not in item2idx:
         return []
 
-    valid_idxs, valid_factors, min_norm = _precompute_valid_items(als_model, mappings)
+    index, valid_idxs, _ = _build_faiss_index(als_model, mappings)
 
     query_idx = item2idx[query_repo_id]
     query_vec = als_model.item_factors[query_idx].reshape(1, -1)
+    query_normed = (query_vec / np.linalg.norm(query_vec)).astype(np.float32)
 
-    # Cosine similarity with valid items only
-    sims = cosine_similarity(query_vec, valid_factors)[0]
-    top_idxs = np.argsort(-sims)
+    scores, indices = index.search(query_normed, n_candidates + 1)
 
     candidates = []
-    for idx in top_idxs:
-        real_idx = valid_idxs[idx]
-        repo_id = idx2item[real_idx]
+    for i in range(len(indices[0])):
+        idx = indices[0][i]
+        if idx < 0:
+            continue
+        repo_id = idx2item[valid_idxs[idx]]
         if repo_id == query_repo_id:
             continue
-        candidates.append((repo_id, float(sims[idx])))
+        candidates.append((repo_id, float(scores[0][i])))
         if len(candidates) >= n_candidates:
             break
     return candidates
@@ -107,7 +119,7 @@ def rerank_candidates(query_repo_id, candidates, als_model, ranker, mappings, me
         if iidx is None:
             continue
         i_vec = item_factors[iidx].reshape(1, -1)
-        cos_sim = float(cosine_similarity(q_vec, i_vec)[0, 0])
+        cos_sim = float(np.dot(q_vec[0], i_vec[0]) / (np.linalg.norm(q_vec) * np.linalg.norm(i_vec) + 1e-9))
 
         meta = meta_dict.get(repo_id, {})
         row = [

@@ -63,12 +63,9 @@ def _build_faiss_index(_als_model, _mappings):
     valid_normed = valid_factors / np.linalg.norm(valid_factors, axis=1, keepdims=True)
     valid_normed = np.ascontiguousarray(valid_normed, dtype=np.float32)
 
-    nlist = min(128, len(valid_idxs) // 40)
-    quantizer = faiss.IndexFlatIP(valid_normed.shape[1])
-    index = faiss.IndexIVFFlat(quantizer, valid_normed.shape[1], nlist, faiss.METRIC_INNER_PRODUCT)
-    index.train(valid_normed)
+    # FlatIP: exact search, ~3ms, recall 100% (254K items에서 충분히 빠름)
+    index = faiss.IndexFlatIP(valid_normed.shape[1])
     index.add(valid_normed)
-    index.nprobe = 10
 
     return index, valid_idxs, min_norm
 

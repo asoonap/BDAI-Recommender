@@ -20,6 +20,7 @@ dependencies = [
     "scikit-learn>=1.8.0",
     "scipy>=1.17.1",
     "streamlit>=1.56.0",
+    "torch>=2.11.0",
     "tqdm>=4.67.3",
 ]
 
